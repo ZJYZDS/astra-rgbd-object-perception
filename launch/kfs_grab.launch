@@ -1,0 +1,9 @@
+<launch>
+  <!-- 加载 YAML 配置文件到私有命名空间 -->
+  <rosparam file="$(find mono_cube_pose)/config/default.yaml" command="load" ns="kfs_pose_estimator"/>
+
+  <!-- 可选：覆盖个别参数 -->
+  <!-- <param name="kfs_pose_estimator/cube/side_mm" value="350.0"/> -->
+
+  <node name="kfs_pose_estimator" pkg="mono_cube_pose" type="kfs_grab.py" output="screen"/>
+</launch>

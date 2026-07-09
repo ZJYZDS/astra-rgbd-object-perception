@@ -1,117 +1,100 @@
-# KFS_grab
+# mono_cube_pose
 
-Real-time multi-face KFS detection and 3D localization pipeline for RoboCon 2025. YOLO segmentation + depth-guided projection + RANSAC plane refinement + adaptive TF transform.
+Monocular 6-DOF cube pose estimation for RoboCon 2025.  
+Lightweight ROS Noetic package — single YOLO segmentation mask in, full 3D cube pose out.
 
 ## Pipeline
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌──────────────────┐
-│   RealSense      │    │  YOLOv8-seg     │    │  Mask → 3D       │
-│  RGB-D Capture   │───▶│  Inference      │───▶│  Projection      │
-└─────────────────┘    └─────────────────┘    └────────┬─────────┘
-                                                        │
-                    ┌──────────────────┐                │
-                    │  Serial Output   │◀───────────────┤
-                    │  (to MCU)        │                │
-                    └──────────────────┘                │
-                                      ┌─────────────────▼────────┐
-                                      │  Radius Search +        │
-                                      │  RANSAC Plane Fitting   │
-                                      └─────────────────┬────────┘
-                                                        │
-                                      ┌─────────────────▼────────┐
-                                      │  Face Classification    │
-                                      │  (normal vector →       │
-                                      │   adaptive TF)          │
-                                      └─────────────────┬────────┘
-                                                        │
-                                      ┌─────────────────▼────────┐
-                                      │  Camera Frame →          │
-                                      │  Base Link Transform     │
-                                      │  + Serial Send           │
-                                      └──────────────────────────┘
+RealSense D455i (RGB+D)
+        │
+        ▼
+  YOLOv8-seg ──► mask
+        │
+        ▼
+  erode → hexagon fit → 3 interior sample points
+        │
+        ▼
+  per-point PCA normal (17×17 neighborhood)
+        │
+        ▼
+  cosine clustering → top / front face normals
+        │
+        ▼
+  cube constraint (35 cm side) → full 6-DOF (R, t)
+        │
+        ▼
+  ROS PoseStamped + serial UART output
 ```
 
-## Features
+**Approach**: Instead of processing the full point cloud, we use the hexagon mask geometry to pick 3 interior points guaranteed to lie on single faces — then compute normals only in small neighborhoods around them. Combined with the cube side-length constraint, a single detected face suffices for full 6-DOF.
 
-- **Multi-face recognition** — Classifies which face of the KFS is visible by analyzing plane normal vectors, applies per-face TF transforms automatically
-- **YOLO-guided 3D projection** — Runs YOLOv8 segmentation on RGB, projects mask onto depth-aligned point cloud, filters by mask region
-- **RANSAC plane refinement** — Uses the YOLO center as a seed, performs radius search and RANSAC plane fitting for sub-centimeter accuracy
-- **Serial communication** — Sends computed coordinates to lower-level MCU via UART with custom protocol
-- **Hybrid C++/Python** — Python node for RealSense + YOLO inference, C++ node for PCL processing and serial output
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Framework | ROS Noetic |
-| 2D Detection | YOLOv8-seg (Ultralytics) |
-| 3D Processing | PCL 1.10, librealsense2 |
-| Camera | Intel RealSense D455i |
-| Serial | Boost.Asio `serial` library |
-| Math | Eigen3 |
-
-## ROS Nodes
-
-### Python: `scripts/kfs_grab.py`
-RealSense capture → YOLO inference → mask projection → center calculation → serial send + ROS publish.
-
-**Published topics:**
-- `/kfs_pointcloud` (`sensor_msgs/PointCloud2`) — Mask-filtered point cloud
-- `/center_coord` (`std_msgs/Float32MultiArray`) — Raw center coordinate [x, y, z]
-
-### C++: `src/kfs_grab.cpp`
-Subscribes to point cloud + seed center, performs RANSAC plane fitting, classifies KFS face, applies coordinate transform, sends result via serial.
-
-**Published topics:**
-- `/plane_points` (`sensor_msgs/PointCloud2`) — RANSAC-filtered plane point cloud
-- `/plane_center` (`geometry_msgs/PointStamped`) — Refined center in base link frame
-
-### C++: `src/temp_pub.cpp`
-Bridges the Python center output into a `PointStamped` with proper timestamp for synchronized subscription.
-
-**Published topics:**
-- `/center_point_with_header` (`geometry_msgs/PointStamped`)
-
-### Utility: `scripts/utils/kfs_pointcloud.py`
-Point cloud generation from RealSense depth frame with YOLO mask filtering.
-
-## Dependencies
-
-- ROS Noetic
-- OpenCV
-- PCL ≥ 1.10
-- librealsense2
-- Ultralytics YOLO
-- Boost.Serial
-- Eigen3
-
-## Build
+## Install
 
 ```bash
 cd ~/catkin_ws/src
 git clone https://github.com/ZJYZDS/KFS_grab.git
-cd ..
-catkin_make
+# Python deps: ultralytics, pyrealsense2, torch, numpy, opencv-python
+cd ~/catkin_ws && catkin_make
+source devel/setup.bash
 ```
 
 ## Usage
 
-Launch RealSense camera, then:
-
 ```bash
-# Terminal 1: Python perception node
-rosrun pcd_view_pkg kfs_grab.py
+# Launch with default config
+roslaunch mono_cube_pose kfs_grab.launch
 
-# Terminal 2: C++ plane fitting node
-rosrun pcd_view_pkg kfs_grab
+# Or override individual parameters
+rosrun mono_cube_pose kfs_grab.py _cube/side_mm:=300 _yolo/conf:=0.7
 ```
 
-Or with your existing robot bringup:
+## Topics
 
-```bash
-roslaunch your_robot_bringup kfs_perception.launch
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/kfs_pose` | `geometry_msgs/PoseStamped` | 6-DOF cube pose (position + quaternion) |
+| `/center_coord` | `std_msgs/Float32MultiArray` | Cube center in camera frame [mm] |
+
+## Configuration
+
+All parameters in `config/default.yaml`, loaded via rosparam at launch.
+
+| Namespace | Key | Default | Description |
+|-----------|-----|---------|-------------|
+| `~camera/` | fx, fy, cx, cy | 321.6, ... | Fallback intrinsics (auto-updated from camera) |
+| `~yolo/` | model_path | — | YOLOv8-seg weights path |
+| | img_sz | 640 | Inference image size |
+| | conf | 0.5 | Detection confidence threshold |
+| | iou | 0.5 | NMS IoU threshold |
+| `~serial/` | port | /dev/ttyUSB0 | UART device path |
+| | baudrate | 115200 | Baud rate |
+| `~mask/` | erode_kernel | 5 | Erosion kernel size |
+| | erode_iterations | 2 | Erosion passes |
+| | polygon_epsilon_factor | 0.015 | approxPolyDP precision |
+| `~normal/` | sample_half_window | 8 | PCA neighborhood half-size (17×17) |
+| | min_valid_points | 30 | Minimum valid depth points per sample |
+| | cluster_cosine_threshold | 0.6 | Normal clustering cosine threshold |
+| `~depth/` | min_mm | 0 | Valid depth minimum [mm] |
+| | max_mm | 3000 | Valid depth maximum [mm] |
+| `~cube/` | side_mm | 350.0 | Cube side length [mm] |
+| `~z_filter/` | buffer_size | 5 | Rolling median buffer size |
+| | anomaly_threshold_mm | 300 | Z anomaly rejection threshold |
+| `~axis_mapping/` | offset_x/y/z_mm | 0,0,0 | Camera→base_link translation offsets |
+
+## Serial Protocol
+
+Little-endian, 3×float32 (x, y, z in mm):
+
 ```
+0x0B | float32 x | float32 y | float32 z | 0x1A
+```
+
+## Hardware
+
+- Intel RealSense D455i (RGB + depth, 640×480 @30Hz)
+- YOLOv8-seg model (`best.pt`)
+- Serial UART to MCU (`/dev/ttyUSB0`)
 
 ## License
 
