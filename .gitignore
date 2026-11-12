@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+install/
+log/
+
+# 数据 / 产物（不入库）
+*.bag
+*.db3
+*.mcap
+bags/
+*.mp4.tmp
+~/grasp_ds/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 系统
+.DS_Store

@@ -1,0 +1,67 @@
+astra_seg_cloud:
+  ros__parameters:
+    # ---- 模型 ----
+    model_path: "~/astra_models/yolo26s-seg.onnx"   # yolo26s-seg：book 0.30→0.85，单帧 13.5ms
+    # 回退：~/astra_models/yolov8s-seg.onnx（配合 conf_thres: 0.15）
+    imgsz: 640
+    conf_thres: 0.25          # yolo26s 下 book 中位 0.81，0.25 足够；配合白名单与 ROI
+    iou_thres: 0.45
+
+    # 类别白名单（空 = 全部 80 类）。可写类别名或 COCO id。
+    # 当前只保留：cup(水杯) / keyboard(键盘) / book(书/本子)
+    target_classes: ["cup", "keyboard", "book", "bottle"]
+
+    # ---- 相机内参（320x240, depth_align: true, 已 rectified 无畸变）----
+    fx: 285.1711
+    fy: 285.1711
+    cx: 159.5
+    cy: 119.5
+
+    # ---- mask 后处理 ----
+    erode_kernel: 3          # 腐蚀核；>1 才生效，细长物体建议 3
+    min_points: 30           # 少于该点数视为无效实例
+    min_depth: 0.15          # 米，低于此值丢弃
+    max_depth: 6.0           # 米，高于此值丢弃
+    pixel_stride: 1          # 1=全像素；2=隔行隔列，点数减 4 倍
+
+    # ---- 同步与队列 ----
+    sync_slop: 0.05          # 近似时间同步容差（秒）
+    sync_queue: 10
+    queue_size: 4            # 生产者-消费者队列；满则丢最旧帧
+
+    # ---- 跟踪 ----
+    track_iou: 0.3
+    track_max_age: 15        # 连续 15 帧（约 1.2s）未命中才回收 ID
+
+    # ---- 中心区域过滤：只收画面中央的检测，挡掉边缘干扰物/整幅背景 ----
+    roi_enable: true
+    roi_margin: 0.10         # 四边各裁掉 10%（0.1 → ROI 为画面中央 80% 区域）
+    roi_min_inside: 0.80     # 框面积至少 80% 落在 ROI 内
+    roi_max_bbox_area: 0.35  # 框面积超过整幅 35% 视为背景，直接丢
+
+    # ---- 落包 ----
+    record_bag: true
+    bag_dir: "~/bags"
+    bag_path: ""             # 非空则直接用该路径
+    save_depth: false        # 是否把深度图也写进 bag
+    max_frames: 0            # >0 时处理这么多帧后自动退出（测试用）
+
+    # ---- 圆柱类物体（cup/bottle 用圆拟合，不做平面拟合）----
+    cylinder_classes: ["cup", "bottle"]
+    table_stride: 6            # 桌面平面估计的深度图采样步长（越大越快）
+    table_max_jump_deg: 8.0    # 相邻帧桌面法线最大跳变（超过则拒绝，防锁到别的平面）
+
+    # ---- OBB / 抓取 ----
+    enable_obb: true         # 是否估计 6DoF / OBB / 抓取位姿
+    obb_margin: 0.001        # OBB 外扩余量（米），补偿边缘无效深度
+    pose_smooth_alpha: 0.30  # 位姿时序平滑系数，越小越稳（0~1）
+    suction_radius: 0.03     # 吸盘半径（米）
+    jaw_max_open: 0.08       # 平行夹爪最大开口（米）
+    jaw_min_open: 0.0
+    jaw_width: 0.04          # 手指宽度（米）
+    grasp_standoff: 0.02     # 抓取点沿接近方向退让距离（米）
+
+    # ---- 调试 ----
+    draw_grasp: false        # 是否在标注图上画抓取标记（吸盘圆点/夹爪线）
+    debug_cloud: true        # 是否发布 RViz 调试点云（plane / objects / boxes / all）
+    debug_detail: false      # true 时打印每个实例的分段耗时
