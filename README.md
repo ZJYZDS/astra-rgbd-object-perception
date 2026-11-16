@@ -54,6 +54,31 @@
 判据：**"框内点 100%" 是弱指标**（不证明框紧），要看 `框尺寸 vs 点云范围` 与真值；
 **不要拿 2D mask 去对齐 3D 框**；框底面近角的投影本来就比接触线低几像素（几何必然）。
 
+## 话题
+
+| 话题 | 方向 | 类型 | 作用 |
+|---|---|---|---|
+| `/camera/color/image_raw` | 订阅 | `Image` | 彩色 320×240 rgb8，15 fps |
+| `/camera/depth/image_raw` | 订阅 | `Image` | 深度 16UC1，30 fps（已与彩色对齐） |
+| `/astra_seg/objects` | 发布 | `ObjectClouds` | **核心输出**：每实例点云 + 6DoF OBB + 抓取候选 |
+| `/astra_seg/annotated` | 发布 | `Image` | RGB + 3D 框 + 三轴 + 字幕（调试模式下叠加 mask） |
+| `/astra_seg/color` | 发布 | `Image` | 落包用的原始彩色帧 |
+| `/astra_seg/depth` | 发布 | `Image` | 可选落包（`save_depth: true`） |
+| `/astra_seg/yaw_valid` | 发布 | `UInt8MultiArray` | 每个实例的 yaw 是否可信（1/0） |
+
+`ObjectClouds` 字段：`ids/labels/scores`、`clouds`（xyz+rgb 点云）、`obb_poses`（位置+四元数）、
+`obb_dims`（l,w,h）、`obb_corners`（8 角点）、`grasp_poses/types/widths/scores`。
+所有点云与位姿都在 `camera_color_optical_frame` 下（RViz 的 Fixed Frame 就设它）。
+
+### 调试话题（`debug_cloud: true`）
+
+| 话题 | 内容 | 用来查什么 |
+|---|---|---|
+| `/astra_seg/debug/plane` | 桌面平面内点（灰，≤2500 点） | 去桌面是否干净、桌面法线是否歪 |
+| `/astra_seg/debug/objects` | 各实例**认领到的**点云（真实 RGB） | 点归属对不对（有没有混入邻居的点） |
+| `/astra_seg/debug/boxes` | 3D 框 12 条棱离散点（4 mm，每实例一色） | 框是否贴合、朝向是否合理 |
+| `/astra_seg/debug/all` | 上面三者合并成一条 | 一个 `PointCloud2` 看全场景 |
+
 ## 运行
 
 ```bash
