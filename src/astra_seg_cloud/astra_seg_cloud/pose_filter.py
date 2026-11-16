@@ -54,10 +54,20 @@ def _slerp(q0, q1, t):
 
 
 class PoseSmoother:
-    def __init__(self, alpha=0.35, max_age=30):
-        """alpha 越小越平滑（0~1）。"""
+    def __init__(self, alpha=0.35, max_age=30,
+                 dim_max_jump=0.35, dim_max_step=0.12,
+                 center_max_step=0.05):
+        """alpha 越小越平滑（0~1）。
+
+        dim_max_jump : 单帧尺寸相对变化超过它 -> 判为异常测量，整帧丢弃（不跟）
+        dim_max_step : 即使正常，每帧尺寸最多变化这个相对比例（防止视觉上的"缩放"）
+        center_max_step : 每帧中心最多移动多少米
+        """
         self.alpha = float(alpha)
         self.max_age = int(max_age)
+        self.dim_max_jump = float(dim_max_jump)
+        self.dim_max_step = float(dim_max_step)
+        self.center_max_step = float(center_max_step)
         self._state = {}
 
     def update(self, track_id, obb):
@@ -85,8 +95,17 @@ class PoseSmoother:
         a = self.alpha
         q_s = _slerp(prev['q'], q, a)
         q_s = q_s / (np.linalg.norm(q_s) + 1e-12)
+
+        # 尺寸：只做异常值拒绝（单帧变化过大时丢弃该测量），不做限速
+        prev_d = np.asarray(prev['d'], dtype=np.float64)
+        rel = np.abs(d - prev_d) / np.maximum(prev_d, 1e-6)
+        if float(np.max(rel)) > self.dim_max_jump:
+            d_s = prev_d.copy()
+        else:
+            d_s = (1 - a) * prev_d + a * d
+
+        # 中心：普通低通（不限速）
         c_s = (1 - a) * prev['c'] + a * c
-        d_s = (1 - a) * prev['d'] + a * d
         R_s = _R_from_quat(q_s)
         self._state[track_id] = {'q': q_s, 'c': c_s, 'd': d_s,
                                  'x': R_s[:, 0].astype(np.float64), 'age': 0}

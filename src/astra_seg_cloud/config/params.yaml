@@ -62,6 +62,8 @@ astra_seg_cloud:
     grasp_standoff: 0.02     # 抓取点沿接近方向退让距离（米）
 
     # ---- 调试 ----
+    debug_mode: false        # 调试模式：才在 RGB 上叠加实例 mask 等调试信息
     draw_grasp: false        # 是否在标注图上画抓取标记（吸盘圆点/夹爪线）
     debug_cloud: true        # 是否发布 RViz 调试点云（plane / objects / boxes / all）
+    scene_pipeline: true     # 整帧点云 + 去平面 + 远到近认领（实验特性，可关）
     debug_detail: false      # true 时打印每个实例的分段耗时

@@ -22,6 +22,21 @@ def project(points, fx, fy, cx, cy):
     return np.stack([u, v], axis=1), ok
 
 
+def draw_mask_overlay(img, mask, color, alpha=0.35, contour=True):
+    """把实例 mask 半透明叠在 RGB 上（用实例颜色），并用 1px 描边。"""
+    if mask is None or not mask.any():
+        return img
+    m = mask.astype(bool)
+    col = np.array(color, dtype=np.float32)
+    region = img[m].astype(np.float32)
+    img[m] = (region * (1.0 - alpha) + col * alpha).astype(np.uint8)
+    if contour:
+        cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cnts, -1, tuple(int(v) for v in color), 1, cv2.LINE_AA)
+    return img
+
+
 def draw_obb(img, obb, fx, fy, cx, cy, color=(0, 255, 255), thickness=1):
     corners = obb.corners()
     uv, ok = project(corners, fx, fy, cx, cy)
@@ -100,11 +115,25 @@ def draw_axes_plain(img, obb, fx, fy, cx, cy, length=0.05, thickness=1):
     return img
 
 
-def caption_strip(lines, width, line_h=12, pad=3):
-    """在图下方拼一条黑底说明条（不遮挡画面）。"""
+def caption_strip(lines, width, line_h=12, pad=3, colors=None, min_lines=0):
+    """在图下方拼一条黑底说明条（不遮挡画面）。
+
+    colors: 可选，每行的实例颜色（BGR），会在文字前画一个小色块，
+            方便把文字和 RViz 里框的颜色对上。
+    """
+    lines = list(lines)
+    # 固定行数：物体数量变化时不改变整张图的高度（否则显示上会"跳"）
+    while len(lines) < max(min_lines, 1):
+        lines.append('')
     h = line_h * max(len(lines), 1) + 2 * pad
     strip = np.zeros((h, width, 3), np.uint8)
     for i, text in enumerate(lines):
-        cv2.putText(strip, text, (4, pad + line_h * (i + 1) - 3),
+        x0 = 4
+        if colors is not None and i < len(colors) and colors[i] is not None:
+            c = tuple(int(v) for v in colors[i])
+            cv2.rectangle(strip, (x0, pad + line_h * i + 1),
+                          (x0 + 7, pad + line_h * i + line_h - 2), c, -1)
+            x0 += 10
+        cv2.putText(strip, text, (x0, pad + line_h * (i + 1) - 3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.27, (220, 220, 220), 1, cv2.LINE_AA)
     return strip

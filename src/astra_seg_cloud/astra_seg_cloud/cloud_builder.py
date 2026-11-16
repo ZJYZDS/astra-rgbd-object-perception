@@ -41,15 +41,32 @@ def build_cloud(header, points, colors_bgr):
     return msg
 
 
-def obb_edge_points(obb, step=0.012):
-    """把 OBB 的 12 条棱离散成点（用于 RViz 里"看到"3D 框）。"""
+def obb_edge_points(obb, step=0.004, max_per_edge=90):
+    """把 OBB 的 12 条棱离散成点（RViz 里"看到"3D 框）。
+
+    step: 点间距（米），默认 4mm → 框看起来是连续线。
+    长边会按 max_per_edge 自动放宽，避免大物体点数爆炸。
+    """
     c = obb.corners()
     edges = [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4),
              (0, 4), (1, 5), (2, 6), (3, 7)]
     pts = []
     for a, b in edges:
         pa, pb = c[a], c[b]
-        n = max(int(np.linalg.norm(pb - pa) / step), 2)
+        L = float(np.linalg.norm(pb - pa))
+        n = int(np.clip(round(L / step), 4, max_per_edge))
         t = np.linspace(0.0, 1.0, n)[:, None]
         pts.append(pa[None, :] * (1 - t) + pb[None, :] * t)
     return np.vstack(pts).astype(np.float32)
+
+
+def instance_color(idx):
+    """按实例序号给一个高对比、互不相同的颜色（BGR），黄金角散开色相。"""
+    h = (float(idx) * 0.61803398875) % 1.0
+    s, v = 1.0, 1.0
+    i = int(h * 6.0) % 6
+    f = h * 6.0 - int(h * 6.0)
+    p_, q_, t_ = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    rgb = [(v, t_, p_), (q_, v, p_), (p_, v, t_), (p_, q_, v), (t_, p_, v), (v, p_, q_)][i]
+    r, g, b = [int(round(255 * x)) for x in rgb]
+    return np.array([b, g, r], dtype=np.uint8)   # BGR

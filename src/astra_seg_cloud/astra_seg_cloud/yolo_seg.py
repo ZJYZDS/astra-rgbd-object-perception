@@ -27,6 +27,19 @@ COCO_CLASSES = [
 ]
 
 
+# 当前使用的类别表：默认 COCO；自定义模型可用 set_class_names() 覆盖
+CLASS_NAMES = COCO_CLASSES
+
+
+def set_class_names(names):
+    """切换到自定义模型的类别表（按类别 id 顺序）。"""
+    global CLASS_NAMES
+    names = [str(x) for x in names]
+    if names:
+        CLASS_NAMES = names
+    return CLASS_NAMES
+
+
 class Detection:
     """一个实例：原图坐标下的框、类别、置信度、二值 mask。"""
 
@@ -40,8 +53,8 @@ class Detection:
 
     @property
     def label(self):
-        if 0 <= self.class_id < len(COCO_CLASSES):
-            return COCO_CLASSES[self.class_id]
+        if 0 <= self.class_id < len(CLASS_NAMES):
+            return CLASS_NAMES[self.class_id]
         return f'class_{self.class_id}'
 
 
@@ -71,7 +84,7 @@ def _nms(boxes_xywh, scores, iou_thres):
 
 
 def resolve_class_ids(names):
-    """把类别名（或数字 id）解析成 COCO 类别 id 集合。"""
+    """把类别名（或数字 id）解析成当前类别表的 id 集合。"""
     ids = set()
     unknown = []
     for raw in names:
@@ -80,24 +93,36 @@ def resolve_class_ids(names):
             continue
         if name.isdigit():
             ids.add(int(name))
-        elif name in COCO_CLASSES:
-            ids.add(COCO_CLASSES.index(name))
+        elif name in [c.lower() for c in CLASS_NAMES]:
+            ids.add([c.lower() for c in CLASS_NAMES].index(name))
         else:
             unknown.append(name)
     if unknown:
         raise ValueError(
-            f'未知类别: {unknown}；COCO 可用类别见 yolo_seg.COCO_CLASSES')
+            f'未知类别: {unknown}；当前可用类别: {list(CLASS_NAMES)}')
     return ids
 
 
 class YoloSegOnnx:
     def __init__(self, model_path, imgsz=640, conf_thres=0.25, iou_thres=0.45,
-                 allowed_class_ids=None, providers=None, logger=None):
+                 allowed_class_ids=None, providers=None, logger=None,
+                 class_conf=None):
+        self.class_conf = dict(class_conf or {})     # {class_id: 专属阈值}
         import onnxruntime as ort
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         so.log_severity_level = 3
+        # 关键：ONNX Runtime 默认会开一堆线程并**自旋等待**，
+        # 在 20 核机器上能占到 1800% CPU，反而拖慢管线且抢 CPU。
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        try:
+            so.add_session_config_entry('session.intra_op.allow_spinning', '0')
+            so.add_session_config_entry('session.inter_op.allow_spinning', '0')
+        except Exception:
+            pass
         if providers is None:
             avail = ort.get_available_providers()
             providers = [p for p in ('CUDAExecutionProvider',
@@ -170,7 +195,14 @@ class YoloSegOnnx:
         class_ids = np.argmax(cls_scores, axis=1)
         scores = cls_scores[np.arange(len(class_ids)), class_ids]
 
-        keep = scores >= self.conf_thres
+        # 每个类别可以有更低的阈值（例如 remote 用 0.08，其余 0.12）
+        if self.class_conf:
+            thr = np.full(len(class_ids), float(self.conf_thres), dtype=np.float32)
+            for cid, cthr in self.class_conf.items():
+                thr[class_ids == int(cid)] = float(cthr)
+        else:
+            thr = float(self.conf_thres)
+        keep = scores >= thr
         if self.allowed_class_ids is not None:
             keep &= np.isin(class_ids, list(self.allowed_class_ids))
         if not np.any(keep):

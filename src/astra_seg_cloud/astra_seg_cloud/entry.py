@@ -12,6 +12,13 @@ cv_bridge 撑坏。这里在导入任何科学计算库之前做两件事：
 import os
 import sys
 
+# 必须在导入 numpy / cv2 / onnxruntime 之前限线程：
+# 默认 OpenBLAS 会按核数(20)开线程并自旋，实测把 CPU 吃到 1800%，
+# 反而拖慢管线（同一份代码限成 1 线程后帧率反而更高）。
+for _k in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+           'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+    os.environ.setdefault(_k, '1')
+
 
 def _strip_user_site():
     try:

@@ -276,7 +276,7 @@ def _unproject(u, v, n, plane_d, K):
     return ray * (-plane_d / denom)
 
 
-def clean_by_plane(points, thresh=0.010, voxel=0.008):
+def clean_by_plane(points, thresh=0.005, voxel=0.012, iters=60):
     """剔除离主平面过远的点（键盘后方的背景/深度飞点）。
 
     mask 里常混入物体后方的桌面点，离平面 5cm 以上；不剔除会把框撑厚。
@@ -285,7 +285,8 @@ def clean_by_plane(points, thresh=0.010, voxel=0.008):
     if len(pts_in) < 50:
         return pts_in, np.ones(len(pts_in), dtype=bool)
     p = voxel_downsample(pts_in, voxel)
-    r = ransac_plane(p, thresh=0.008, iters=50)
+    # RANSAC 的内点阈值比最终阈值更严一点，保证平面估计本身干净
+    r = ransac_plane(p, thresh=min(thresh * 0.8, 0.006), iters=iters)
     if r is None:
         return pts_in, np.ones(len(pts_in), dtype=bool)
     n, d, mask = r
@@ -528,6 +529,67 @@ def fit_cylinder_obb(points, label, n_table, d_table, K=None, margin=0.002,
     meta = {'yaw_valid': yaw_valid, 'handle_deg': handle_deg,
             'r': r, 'd_handle': d_handle, 'h': h}
     return obb, meta
+
+
+def fit_obb_on_plane(points, n_pl, d_pl, margin=0.002, band=0.010,
+                     min_frac=0.25, min_keep=40):
+    """物体站在某个平面（桌面，或另一个物体的顶面）上时的 OBB。
+
+    关键点：不再让点云自己猜 z 轴，而是**用支撑面的法线当 z**，
+    底面就压在支撑面上。这样 x/y 方向的污染点只影响长宽，不会把框掰歪。
+
+    触发条件：点云里有 |h| < band 的点占比 >= min_frac（说明 mask 吃进了支撑面）。
+    h = n·p + d，即相对支撑面的高度。
+    """
+    P = np.asarray(points, dtype=np.float32)
+    if len(P) < min_keep:
+        return None
+    h = P @ np.asarray(n_pl, dtype=np.float32) + float(d_pl)
+    frac = float((np.abs(h) < band).mean())
+    if frac < min_frac:
+        return None
+    keep = h > band                       # 去掉贴在支撑面上的污染点
+    if keep.sum() < min_keep:
+        # 点云本身就是一层薄面（比如只看到书的顶面）：用全部点，
+        # 高度取"可见厚度"，避免直接判失败。
+        keep = np.ones(len(h), dtype=bool)
+    Q = P[keep]
+    hq = h[keep]
+
+    n = np.asarray(n_pl, dtype=np.float64)
+    n = n / np.linalg.norm(n)
+    # 平面内一组基
+    ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = np.cross(n, ref); u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    uv = Q.astype(np.float64) @ np.stack([u, v], axis=1)
+    rect = cv2.minAreaRect(uv.astype(np.float32))
+    box = cv2.boxPoints(rect).astype(np.float64)
+    e1 = box[1] - box[0]
+    e2 = box[3] - box[0]
+    l1, l2 = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+    if l1 < 0.01 or l2 < 0.01:
+        return None
+    ax1 = e1 / l1
+    # 3D 方向
+    X = ax1[0] * u + ax1[1] * v
+    X /= np.linalg.norm(X)
+    Y = np.cross(n, X)
+    cx, cy = rect[0]
+
+    h_top = float(np.percentile(hq, 99))
+    if h_top < 0.01:
+        return None
+    p0 = cx * u + cy * v
+    p0 = p0 - (float(n @ p0) + float(d_pl)) * n      # 投到支撑面上
+    center = p0 + 0.5 * h_top * n
+
+    R = np.stack([X, Y, n], axis=1)
+    dims = np.array([max(l1, l2), min(l1, l2), h_top], dtype=np.float32) + margin
+    obb = Obb(center, R, dims, n, plane_ratio=1.0, rmse=0.0,
+              n_points=int(keep.sum()), source='support')
+    return contain_points(obb, Q)
 
 
 def split_raised(points, thresh=0.015, min_points=80, min_extent=0.02,
