@@ -644,6 +644,32 @@ def split_raised(points, thresh=0.015, min_points=80, min_extent=0.02,
     return ~raised, raised
 
 
+def tighten_to_points(obb, points, lo=1.0, hi=99.0, margin=0.001):
+    """把框收紧到"点云自身的范围"（沿框轴的分位范围）。
+
+    contain_points 只保证"包住"，尺寸仍由 mask 四边形决定，mask 偏大时框就松；
+    这里再按点云范围收一次，让框贴着实际点云（遮挡时会偏小，由调用方决定是否启用）。
+    """
+    if obb is None or points is None or len(points) < 20:
+        return obb
+    rel = (np.asarray(points, dtype=np.float32) - obb.center) @ obb.rotation
+    q_lo = np.percentile(rel, lo, axis=0)
+    q_hi = np.percentile(rel, hi, axis=0)
+    ext = np.maximum(q_hi - q_lo, 0.004)
+    half_old = obb.dims / 2.0
+    # 只收 x/y（footprint）：z 是厚度方向，单视角只看到上表面，
+    # 点云在 z 上的范围是"表面粗糙度"而不是物体高度，不能用来收紧。
+    new_dims = obb.dims.copy()
+    new_dims[0] = min(ext[0] + margin, obb.dims[0])
+    new_dims[1] = min(ext[1] + margin, obb.dims[1])
+    shift = (q_lo + q_hi) / 2.0
+    shift[2] = 0.0                     # 厚度方向不动
+    shift = np.clip(shift, -half_old, half_old)
+    obb.center = (obb.center + obb.rotation @ shift.astype(np.float32)).astype(np.float32)
+    obb.dims = new_dims.astype(np.float32)
+    return obb
+
+
 def contain_points(obb, points, margin=0.002):
     """把 OBB 扩到严格包住点云（在 OBB 自身坐标系里求紧包围盒）。
 
@@ -735,11 +761,16 @@ def _obb_from_quad(obb, quad, K, thickness, margin):
         def res(p_):
             return (rect_pts(p_[0], p_[1], p_[2], p_[3], p_[4]) - tgt).ravel()
 
-        sol = least_squares(res, [0, 0, th0, l0, w0],
-                            bounds=([-0.3, -0.3, -np.pi, 0.02, 0.01],
-                                    [0.3, 0.3, np.pi, 0.8, 0.5]),
-                            max_nfev=50)
-        cx2, cy2, th, l, w = sol.x
+        # 初值残差已经够小就别优化（省 2-4 ms/物体）
+        r0 = np.linalg.norm(res([0, 0, th0, l0, w0])) / 4.0
+        if r0 < 0.002:
+            cx2, cy2, th, l, w = 0.0, 0.0, th0, l0, w0
+        else:
+            sol = least_squares(res, [0, 0, th0, l0, w0],
+                                bounds=([-0.3, -0.3, -np.pi, 0.02, 0.01],
+                                        [0.3, 0.3, np.pi, 0.8, 0.5]),
+                                max_nfev=25)
+            cx2, cy2, th, l, w = sol.x
     except Exception:
         cx2, cy2, th, l, w = 0.0, 0.0, th0, l0, w0
 

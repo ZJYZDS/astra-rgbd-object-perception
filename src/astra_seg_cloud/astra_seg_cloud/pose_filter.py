@@ -122,3 +122,46 @@ class PoseSmoother:
                 self._state[k]['age'] += 1
                 if self._state[k]['age'] > self.max_age:
                     del self._state[k]
+
+
+class SizePrior:
+    """每类尺寸的时序先验：中位数 + MAD，只替换 3σ 以外的离群测量。
+
+    和"每帧限速"不同：正常帧原样输出（无滞后），只有明显错的帧才用先验顶掉。
+    """
+
+    def __init__(self, window=150, min_samples=20, k=3.0, floor=0.01):
+        from collections import deque
+        self._h = {}
+        self._deque = deque
+        self.window = int(window)
+        self.min_samples = int(min_samples)
+        self.k = float(k)
+        self.floor = float(floor)
+
+    def refine(self, label, dims, update=True):
+        """返回（可能被先验替换的）dims；只有 update=True 时才写历史。
+
+        update=False 用于"被遮挡"的帧：这时 footprint 天然偏小，
+        写进历史会把先验拖偏（时序污染）。这类帧只读先验、不回写。
+        """
+        d = np.asarray(dims, dtype=np.float32)
+        h = self._h.get(label)
+        if h is None:
+            h = self._h[label] = self._deque(maxlen=self.window)
+        if not update:
+            if len(h) >= self.min_samples:
+                return np.median(np.asarray(h, dtype=np.float32), axis=0).astype(np.float32)
+            return d
+        if len(h) >= self.min_samples:
+            arr = np.asarray(h, dtype=np.float32)
+            med = np.median(arr, axis=0)
+            mad = np.median(np.abs(arr - med), axis=0) * 1.4826
+            tol = np.maximum(self.k * mad, self.floor)
+            bad = np.abs(d - med) > tol
+            if bool(np.any(bad)):
+                d = d.copy()
+                d[bad] = med[bad]
+                return d.astype(np.float32)
+        h.append(d.copy())
+        return d

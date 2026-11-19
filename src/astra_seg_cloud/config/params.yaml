@@ -9,7 +9,7 @@ astra_seg_cloud:
 
     # 类别白名单（空 = 全部 80 类）。可写类别名或 COCO id。
     # 当前只保留：cup(水杯) / keyboard(键盘) / book(书/本子)
-    target_classes: ["cup", "keyboard", "book", "bottle"]
+    target_classes: ['cup', 'keyboard', 'book', 'bottle', 'cell phone']
 
     # ---- 相机内参（320x240, depth_align: true, 已 rectified 无畸变）----
     fx: 285.1711
@@ -61,7 +61,19 @@ astra_seg_cloud:
     jaw_width: 0.04          # 手指宽度（米）
     grasp_standoff: 0.02     # 抓取点沿接近方向退让距离（米）
 
+    # ---- 点云裁剪 / 遮挡 / 尺寸先验 ----
+    trim_mode: plane         # plane=固定平面裁剪（实测更贴）/ grow=邻域区域生长（抗污染但偏松）
+    plane_clean_thresh: 0.004
+    tighten_to_cloud: false  # 按点云范围收 footprint（实测偏小：平面裁剪会丢边缘点）
+    size_prior_enable: false  # 尺寸先验：实测会把偏松的尺寸学进去，默认关
+    size_prior_window: 150
+    size_prior_min: 20
+    occ_prior_thr: 0.15      # mask 被更近物体减掉超过它 -> 不写尺寸先验
+    occ_quality_thr: 0.35    # 减掉超过它 -> quality=0
+
     # ---- 调试 ----
+    label_vote_decay: 0.85    # 类别投票记忆衰减（按 track 累加分数，防标签抖动）
+    unknown_score: 0.30       # 投票最高分低于它 -> 标签记 object
     debug_mode: false        # 调试模式：才在 RGB 上叠加实例 mask 等调试信息
     draw_grasp: false        # 是否在标注图上画抓取标记（吸盘圆点/夹爪线）
     debug_cloud: true        # 是否发布 RViz 调试点云（plane / objects / boxes / all）

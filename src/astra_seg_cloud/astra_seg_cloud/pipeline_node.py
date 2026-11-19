@@ -39,15 +39,16 @@ from .cloud_builder import build_cloud, instance_color, obb_edge_points
 from .grasp import GripperConfig, evaluate
 from .obb import (clean_by_plane, depth_to_points, filter_to_obb, fit_cylinder_obb,
                   fit_obb, fit_obb_on_plane, mask_quad, quat_from_matrix,
+                  tighten_to_points,
                   ransac_plane_largest, voxel_downsample)
 from std_msgs.msg import UInt8MultiArray
-from .pose_filter import PoseSmoother
+from .pose_filter import PoseSmoother, SizePrior
 from .projection import deproject, erode_mask
-from .scene import (claim_mask, deproject_frame, depth_order, mask_uv_index,
-                    remove_big_planes)
+from .scene import (claim_mask, deproject_frame, depth_order, grow_surface,
+                    mask_uv_index, remove_big_planes)
 from .tracker import IouTracker
 from . import yolo_seg
-from .yolo_seg import YoloSegOnnx, resolve_class_ids, set_class_names
+from .yolo_seg import Detection, YoloSegOnnx, resolve_class_ids, set_class_names
 
 class _NamedDet:
     """把副模型的检测包装成和 Detection 一样的接口，但 label 由我们指定。"""
@@ -145,7 +146,17 @@ class SegCloudNode(Node):
         self.secondary_imgsz = int(p('secondary_imgsz', 1024).value)
         self.secondary_conf = float(p('secondary_conf', 0.25).value)
         self.secondary = None
-        self.caption_lines = int(p('caption_lines', 5).value)   # 字幕固定行数（防图像高度跳变）
+        self.caption_lines = int(p('caption_lines', 5).value)
+        self.trim_mode = str(p('trim_mode', 'plane').value)   # plane=固定平面裁剪 / grow=邻域区域生长
+        self.vote_decay = float(p('label_vote_decay', 0.85).value)      # 类别投票的记忆衰减
+        self.unknown_score = float(p('unknown_score', 0.30).value)      # 低于它就叫 object
+        self.min_label_score = float(p('min_label_score', 0.30).value)  # 单帧分低于它直接用 object
+        self._label_acc = {}
+        self._label_out = {}
+        import collections as _c
+        self._prof = _c.defaultdict(list)          # tid -> 当前输出标签（带迟滞，避免来回跳）
+        self.occ_prior_thr = float(p('occ_prior_thr', 0.15).value)   # 遮挡超过它就不写尺寸先验
+        self.occ_quality_thr = float(p('occ_quality_thr', 0.35).value)  # 遮挡超过它判为可疑   # 字幕固定行数（防图像高度跳变）
 
         # ---- OBB / 抓取 ----
         self.enable_obb = bool(p('enable_obb', True).value)
@@ -156,6 +167,11 @@ class SegCloudNode(Node):
             dim_max_jump=float(p('pose_dim_max_jump', 0.35).value),
             dim_max_step=float(p('pose_dim_max_step', 0.12).value),
             center_max_step=float(p('pose_center_max_step', 0.05).value))
+        self.size_prior_enable = bool(p('size_prior_enable', False).value)
+        self.tighten_cloud = bool(p('tighten_to_cloud', False).value)  # 实测会把框收小，默认关
+        self.size_prior = SizePrior(
+            window=int(p('size_prior_window', 150).value),
+            min_samples=int(p('size_prior_min', 20).value))
         self.gripper = GripperConfig(
             suction_radius=float(p('suction_radius', 0.03).value),
             jaw_max_open=float(p('jaw_max_open', 0.08).value),
@@ -444,6 +460,9 @@ class SegCloudNode(Node):
                                        throttle_duration_sec=5.0)
         dets = self._filter_roi(dets, w, h)
         ids = self.tracker.update(dets)
+        # 类别投票：同一个 track 的标签不随单帧分数抖动（book->cell phone->remote）
+        voted = self._vote_labels(ids, dets)
+        dets = [_NamedDet(d, voted.get(int(i), d.label)) for d, i in zip(dets, ids)]
         t_infer = time.perf_counter()
 
         header = Header()
@@ -525,10 +544,26 @@ class SegCloudNode(Node):
 
             if self.enable_obb:
                 self._fill_pose(out, obb, grasp)
-                self._draw(annot, obb, grasp, det, out, it.get('mask_dbg'))
+                out.quality.append(int(it.get('quality', 1)))
+                self._draw(annot, obb, grasp, det, out, it.get('mask_dbg'),
+                           int(it.get('quality', 1)))
 
         self.pose_smoother.prune(set(int(i) for i in ids))
+        # 注意：不能按"这一帧没出现"就删投票记忆——漏检 1 帧就把历史清掉，
+        # 标签会立刻在 book/cell phone 之间来回跳。用分数自然衰减来回收。
+        for k in list(self._label_acc):
+            tot = sum(self._label_acc[k].values())
+            if tot < 0.02:
+                del self._label_acc[k]
+                self._label_out.pop(k, None)
         self.pose_smoother.prune(set(int(i) for i in ids))
+        # 注意：不能按"这一帧没出现"就删投票记忆——漏检 1 帧就把历史清掉，
+        # 标签会立刻在 book/cell phone 之间来回跳。用分数自然衰减来回收。
+        for k in list(self._label_acc):
+            tot = sum(self._label_acc[k].values())
+            if tot < 0.02:
+                del self._label_acc[k]
+                self._label_out.pop(k, None)
         t_cloud = time.perf_counter()
 
         ann_msg = None
@@ -649,6 +684,8 @@ class SegCloudNode(Node):
         这里只改"点的归属"和"处理顺序"。
         """
         h, w = bgr.shape[:2]
+        import time as _t
+        _t0 = _t.perf_counter()
         pts, uv, _ = deproject_frame(
             depth, self.fx, self.fy, self.cx, self.cy,
             stride=max(2, int(self.scene_stride)),
@@ -657,6 +694,8 @@ class SegCloudNode(Node):
         if pts is None or len(pts) < 200:
             return []
         cols = bgr[np.clip(uv[:, 1], 0, h - 1), np.clip(uv[:, 0], 0, w - 1)]
+        _t1 = _t.perf_counter()
+        self._prof['deproj'].append((_t1 - _t0) * 1000)
 
         # 只删"桌面"这一个平面；桌面点单独下采样留给 RViz
         keep, planes, plane_pts = remove_big_planes(
@@ -670,6 +709,8 @@ class SegCloudNode(Node):
                 sel = np.random.default_rng(0).choice(len(tp), 4000, replace=False)
                 tp = tp[sel]
             self._dbg_plane_pts = tp
+        _t2 = _t.perf_counter()
+        self._prof['plane'].append((_t2 - _t1) * 1000)
         pts, uv, cols = pts[keep], uv[keep], cols[keep]
         if len(pts) < 150:
             return []
@@ -694,7 +735,7 @@ class SegCloudNode(Node):
             m = erode_mask(d.mask, self.erode_kernel)
             if m.sum() < 20:
                 m = d.mask
-            dd = type(d)(d.box, d.score, d.class_id, m)
+            dd = _NamedDet(Detection(d.box, d.score, d.class_id, m), d.label)
             dets_er.append(dd)
         # ---- 你的顺序：mask → pts → 平面拟合取 true_pts → 从总点云删 true_pts → 下一个 ----
         order, masks, depth_of = depth_order(dets_er, pts, uv, min_pts=40)
@@ -705,20 +746,57 @@ class SegCloudNode(Node):
             tid = int(ids[k])
             if depth_of.get(k, -1) <= 0:
                 continue
+            mask_px_full = int(masks[k].sum())
+            scene_in_mask = int(mask_uv_index(masks[k], uv).sum())
             m_k = claim_mask(masks, depth_of, k, uv, alive)
+            occ_frac = 1.0 - float(int(m_k.sum())) / max(mask_px_full, 1)
             sel = mask_uv_index(m_k, uv) & alive
             if sel.sum() < 40:
                 continue
             idx = np.nonzero(sel)[0]
             P, C = pts[idx], cols[idx]
+            UVc = uv[idx]
+            # 完整认领点（发布/显示用）；下面 P2 是裁剪后用于拟合的点
+            P_full, C_full = P, C
+            plane_ratio = 1.0
             if det.label in self.cylinder_classes:
                 # 圆柱是曲面：不能按"贴平面"筛，否则会把杯身砍掉只剩一条带
                 P2, C2, idx2 = P, C, idx
+            elif self.trim_mode == 'grow':
+                # 邻域区域生长：从物体最高处向外长，遇到几何断崖就停
+                sub = voxel_downsample(P, 0.012) if len(P) > 400 else P
+                pl = ransac_plane_largest(sub, thresh=0.006, iters=60, min_ratio=0.2)
+                if pl is not None:
+                    n_g = np.asarray(pl[0], dtype=np.float64)
+                    h_g = P.astype(np.float64) @ (n_g / np.linalg.norm(n_g))
+                    seed_h = float(np.percentile(h_g, 99))
+                    keep = grow_surface(P, UVc, seed_h, n_g,
+                                        eps_delta=0.008, eps_total=0.030,
+                                        fine_voxel=0.012)
+                    # 生长结果必须"够大"才信：塌缩/漏长时回退到平面裁剪
+                    if int(keep.sum()) >= max(40, int(0.35 * len(P))):
+                        P2, C2, idx2 = P[keep], C[keep], idx[keep]
+                        plane_ratio = float(keep.sum()) / max(len(P), 1)
+                    else:
+                        P2, keep2 = clean_by_plane(P, thresh=self.plane_clean_thresh)
+                        plane_ratio = float(keep2.sum()) / max(len(P), 1)
+                        if int(keep2.sum()) >= max(40, int(0.4 * len(P))):
+                            P2, C2, idx2 = P[keep2], C[keep2], idx[keep2]
+                        else:
+                            P2, C2, idx2 = P, C, idx
+                else:
+                    P2, keep2 = clean_by_plane(P, thresh=self.plane_clean_thresh)
+                    plane_ratio = float(keep2.sum()) / max(len(P), 1)
+                    if int(keep2.sum()) >= max(40, int(0.4 * len(P))):
+                        P2, C2, idx2 = P[keep2], C[keep2], idx[keep2]
+                    else:
+                        P2, C2, idx2 = P, C, idx
             else:
                 # 平面拟合 → 只保留属于该物体表面的点（true_pts）
                 P2, keep = clean_by_plane(P, thresh=self.plane_clean_thresh)
                 # 保护：严格阈值偶尔会把物体裁得只剩零星点（平面估计偏了），
                 # 这时整帧会被丢弃，表现就是"框忽隐忽现"。留下 <40% 就回退。
+                plane_ratio = float(keep.sum()) / max(len(P), 1)
                 if int(keep.sum()) < max(40, int(0.4 * len(P))):
                     P2, C2, idx2 = P, C, idx
                 else:
@@ -729,12 +807,26 @@ class SegCloudNode(Node):
             alive[idx2] = False          # 只删 true_pts，剩下的留给后面的物体
             UV2 = uv[idx2]
             obb = grasp = None
+            quality = 1
             if self.enable_obb:
                 obb, grasp = self._estimate(P2, det.label, tid, det.mask, depth)
+                if obb is not None and self.tighten_cloud:
+                    obb = tighten_to_points(obb, P2)
                 if obb is not None:
+                    # 尺寸先验：只替换 3σ 以外的离群测量（正常帧不动）
+                    if self.size_prior_enable:
+                        obb.dims = self.size_prior.refine(
+                            det.label, obb.dims,
+                            update=(occ_frac < self.occ_prior_thr))
+                    # 拟合用裁剪点；显示用"完整认领点"再按框裁一次，
+                    # 这样框和点云是同一份几何，不会出现"框比点云大"的观感。
                     P2, keep3 = filter_to_obb(P2, obb)
                     C2 = C2[keep3]
                     UV2 = UV2[keep3]
+                    quality = self._quality(det.label, scene_in_mask, len(idx2),
+                                            P2, obb, plane_ratio)
+                    if occ_frac > self.occ_quality_thr:
+                        quality = 0
             mask_dbg = None
             if self.draw_mask_flag:
                 mask_dbg = np.zeros((h, w), dtype=bool)
@@ -744,8 +836,23 @@ class SegCloudNode(Node):
                 kk = 2 * max(1, int(self.pixel_stride)) + 1
                 mask_dbg = cv2.dilate(mask_dbg.astype(np.uint8),
                                       np.ones((kk, kk), np.uint8), iterations=1).astype(bool)
-            items.append(dict(det=det, tid=tid, pts=P2, cols=C2,
-                              obb=obb, grasp=grasp, mask_dbg=mask_dbg))
+            if obb is not None:
+                # 显示用点云：按框裁（filter_to_obb 只对 source='plane' 生效，
+                # 我们这里是 quad 分支，得自己裁，否则会把框外的杂点也画出来）
+                rel = (P_full - obb.center) @ obb.rotation
+                kv = np.all(np.abs(rel) <= (obb.dims / 2.0 + 0.010), axis=1)
+                if int(kv.sum()) >= 30:
+                    Pv, Cv = P_full[kv], C_full[kv]
+                else:
+                    Pv, Cv = P2, C2
+            else:
+                Pv, Cv = P2, C2
+            _t3 = _t.perf_counter()
+            self._prof['fit'].append((_t3 - _t2) * 1000)
+            _t2 = _t3
+            items.append(dict(det=det, tid=tid, pts=Pv, cols=Cv,
+                              obb=obb, grasp=grasp, mask_dbg=mask_dbg,
+                              quality=quality))
         return items
 
     def _mask_rect(self, mask):
@@ -810,6 +917,73 @@ class SegCloudNode(Node):
             self.get_logger().warn(
                 f'OBB 估计失败: {exc!r}', throttle_duration_sec=5.0)
         return None, None
+
+    def _vote_labels(self, ids, dets):
+        """按 track 做类别投票：累加（带衰减）各帧分数，取最高者；太低就叫 object。"""
+        out = {}
+        for tid, det in zip(ids, dets):
+            tid = int(tid)
+            acc = self._label_acc.get(tid)
+            if acc is None:
+                acc = self._label_acc[tid] = {}
+            for k in list(acc):
+                acc[k] *= self.vote_decay
+            acc[det.label] = acc.get(det.label, 0.0) + float(det.score)
+            best = max(acc, key=acc.get)
+            cur = self._label_out.get(tid)
+            # 迟滞：候选要明显领先（1.25 倍）才换标签，否则保持
+            if cur is not None and cur != best and acc[best] < 1.25 * acc.get(cur, 0.0):
+                best = cur
+            # 已经定过的 track 不再改标签：类名只决定"出生时"那一次，
+            # 之后稳定不变（低分时出生即 object），避免逐帧在 book/cell phone 间跳。
+            if tid in self._label_out:
+                out[tid] = self._label_out[tid]
+                continue
+            if float(det.score) < self.min_label_score:
+                label = 'object'
+            else:
+                label = best if acc[best] >= self.unknown_score else 'object'
+            self._label_out[tid] = label
+            out[tid] = label
+        return out
+
+    def _quality(self, label, mask_px, n_claim, pts, obb, plane_ratio):
+        """可解性门控：只判"这帧可信吗"，不参与几何。"""
+        try:
+            # 分母 = 该 mask 内**有深度的场景点**数（不是 mask 像素数：
+            # 深色物体大量像素没有深度，用像素数会把正常帧判成异常）
+            expected = max(float(mask_px), 1.0)
+            claim_ratio = float(n_claim) / expected
+            if not (0.55 <= claim_ratio <= 1.05):
+                self.get_logger().info(
+                    f'[gate] {label} claim_ratio={claim_ratio:.2f} '
+                    f'(scene_in_mask={int(mask_px)} n={int(n_claim)})',
+                    throttle_duration_sec=1.0)
+                return 0
+            # 噪声要看"沿盒子法线的残差"，不是 z 方向跨度（跨度是几何）
+            n_vec = np.asarray(obb.normal, dtype=np.float64)
+            h = np.asarray(pts, dtype=np.float64) @ n_vec
+            mad = float(np.median(np.abs(h - np.median(h))))
+            size = float(max(obb.dims[2], 1e-3))
+            if mad / size > 0.35:
+                self.get_logger().info(
+                    f'[gate] {label} noise={mad/size:.2f}', throttle_duration_sec=1.0)
+                return 0
+            if label not in self.cylinder_classes:
+                if plane_ratio < 0.55:
+                    self.get_logger().info(
+                        f'[gate] {label} plane_ratio={plane_ratio:.2f}', throttle_duration_sec=1.0)
+                    return 0
+            else:
+                d0, d1 = float(obb.dims[0]), float(obb.dims[1])
+                if max(d0, d1) > 1e-6 and min(d0, d1) / max(d0, d1) < 0.45:
+                    self.get_logger().info(
+                        f'[gate] {label} aspect={min(d0,d1)/max(d0,d1):.2f}',
+                        throttle_duration_sec=1.0)
+                    return 0
+        except Exception:
+            return 1
+        return 1
 
     def _canonical_cylinder_obb(self, obb):
         """回转体的框：朝向固定（与桌面法线绑定），footprint 取直径的正方形。
@@ -878,11 +1052,14 @@ class SegCloudNode(Node):
             out.grasp_scores.append(0.0)
         out.grasp_poses.append(gp)
 
-    def _draw(self, annot, obb, grasp, det, out, mask_dbg=None):
+    def _draw(self, annot, obb, grasp, det, out, mask_dbg=None, quality=1):
         if annot is None or obb is None or grasp is None:
             return
-        # 框颜色 = 该实例在 RViz 里的颜色（和字幕色块、点云框一致）
-        color = tuple(int(v) for v in instance_color(int(out.ids[-1])))
+        # 框颜色 = 该实例在 RViz 里的颜色；质量可疑时画灰色（下游别抓）
+        if quality:
+            color = tuple(int(v) for v in instance_color(int(out.ids[-1])))
+        else:
+            color = (140, 140, 140)
         if mask_dbg is not None:
             draw_mask_overlay(annot, mask_dbg, color, alpha=0.30)
         draw_obb(annot, obb, self.fx, self.fy, self.cx, self.cy, color)
@@ -896,13 +1073,23 @@ class SegCloudNode(Node):
         self._caption_rows[int(out.ids[-1])] = (
             f'id{int(out.ids[-1])} {det.label} ({c[0]:.2f},{c[1]:.2f},{c[2]:.2f})m '
             f'{obb.dims[0]*100:.1f}x{obb.dims[1]*100:.1f}x{obb.dims[2]*100:.1f}cm '
-            f'yaw {yaw_txt}', instance_color(int(out.ids[-1])))
+            f'yaw {yaw_txt}' + ('' if quality else ' [!]'),
+            instance_color(int(out.ids[-1])) if quality else (140, 140, 140))
         self._captions.append(
             f'id{int(out.ids[-1])} {det.label} ({c[0]:.2f},{c[1]:.2f},{c[2]:.2f})m '
             f'{obb.dims[0]*100:.1f}x{obb.dims[1]*100:.1f}x{obb.dims[2]*100:.1f}cm '
             f'yaw {yaw_txt}')
 
     def _log_stats(self):
+        if getattr(self, '_prof', None) and getattr(self, 'debug_detail', False):
+            try:
+                import numpy as _np
+                parts = ' '.join(
+                    f'{k}={_np.median(v):.1f}' for k, v in self._prof.items() if v)
+                self.get_logger().info(f'[prof] {parts} ms')
+                self._prof.clear()
+            except Exception:
+                pass
         now = time.time()
         dt = now - self._stats_t
         if dt < 2.0:

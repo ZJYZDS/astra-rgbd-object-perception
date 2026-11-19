@@ -1,0 +1,21 @@
+# 方案 B：ArUco 实时位姿 GT 配置
+# 用法：python3 scripts/pose_gt_aruco.py --config config/gt_markers.yaml
+dict: DICT_4X4_50
+marker_size_m: 0.12          # ★ 打印出来的黑白边长（米）。实测 12 cm 在 0.9 m 处约 38 px
+mode: planar                 # planar=已知 marker 贴在某个平面上（推荐，抗平面二义性）
+normal: [0.0, -1.0, 0.0]      # marker 面的法线（相机系 y 向下，桌面朝上 = -y）
+
+markers:
+  # marker id -> 物体类别 + marker 到物体的固定变换（量一次）
+  # t_marker_obj: marker 中心 → 物体原点（底面中心）的平移
+  # rpy_marker_obj: marker 系 → 物体系的旋转（弧度）
+  0:
+    label: keyboard
+    dims: [0.310, 0.118, 0.028]
+    t_marker_obj: [0.0, 0.0, -0.015]
+    rpy_marker_obj: [0.0, 0.0, 0.0]
+  1:
+    label: book
+    dims: [0.260, 0.207, 0.027]
+    t_marker_obj: [0.0, 0.0, -0.014]
+    rpy_marker_obj: [0.0, 0.0, 0.0]

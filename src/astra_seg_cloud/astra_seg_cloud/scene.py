@@ -39,7 +39,7 @@ def deproject_frame(depth_mm, fx, fy, cx, cy, stride=2,
     return pts, uv, zz
 
 
-def remove_big_planes(pts, n_planes=2, thresh=0.006, iters=80,
+def remove_big_planes(pts, n_planes=2, thresh=0.006, iters=40,
                       min_ratio=0.20, up_prior=0.45,
                       ref_n=None, ref_d=None, max_angle_deg=10.0,
                       max_offset=0.03):
@@ -55,7 +55,7 @@ def remove_big_planes(pts, n_planes=2, thresh=0.006, iters=80,
     planes = []
     plane_pts = []
     up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-    for _ in range(n_planes + 2):          # 允许跳过几个"假桌面"（比如键盘/书顶面）
+    for _ in range(n_planes + 1):          # 最多跳过 1 个"假桌面"
         if len(planes) >= n_planes:
             break
         idx = np.nonzero(search)[0]
@@ -162,6 +162,71 @@ def trim_depth_outliers(pts, k=3.0, min_band=0.030):
     mad = float(np.median(np.abs(z - med))) * 1.4826
     band = max(k * mad, min_band)
     return np.abs(z - med) <= band
+
+
+def grow_surface(pts, uv, seed_h, n, eps_delta=0.008, eps_total=0.030,
+                 fine_voxel=0.012, shape=(240, 320)):
+    """按"细体素邻域"做区域生长，长出一块同表面的点。
+
+    为什么用体素而不是像素邻域：真实点云是稀疏的（stride 3 时 9 个像素才 1 个点），
+    像素 4-邻域会不断断链；体素邻域天然按空间距离连通。
+
+    与"固定平面阈值"的区别：允许缓慢起伏（相邻体素高度差 < eps_delta），
+    在真实几何断崖（棱边、相邻物体）处停止；eps_total 限制相对种子面的总偏移。
+
+    pts (N,3) 相机系；uv 未使用（保留接口）；seed_h 种子点沿 n 的高度；n 平面法线。
+    """
+    from collections import deque
+    if len(pts) == 0:
+        return np.zeros(0, bool)
+    P = np.asarray(pts, dtype=np.float64)
+    n = np.asarray(n, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    h = P @ n
+
+    # 细体素网格：每格取"最靠前"的点当代表
+    q = np.floor(P / max(float(fine_voxel), 1e-6)).astype(np.int64)
+    keys, inv = np.unique(q, axis=0, return_inverse=True)
+    order = np.argsort(-P[:, 2])
+    rep = np.full(len(keys), -1, dtype=np.int64)
+    rep[inv[order]] = order                      # z 最小的点做代表
+    cell_index = {tuple(keys[i]): i for i in range(len(keys))}
+
+    seed = int(np.argmin(np.abs(h - float(seed_h))))
+    seed_cell = int(inv[seed])
+    h_cell = np.full(len(keys), np.nan)
+    for i in range(len(keys)):
+        if rep[i] >= 0:
+            h_cell[i] = h[rep[i]]
+
+    visited = np.zeros(len(keys), bool)
+    visited[seed_cell] = True
+    keep_cells = [seed_cell]
+    dq = deque([seed_cell])
+    neighbours = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    while dq:
+        cur = int(dq.popleft())
+        kc = keys[cur]
+        hc = h_cell[cur]
+        for d in neighbours:
+            nb = cell_index.get((int(kc[0] + d[0]), int(kc[1] + d[1]), int(kc[2] + d[2])))
+            if nb is None or visited[nb]:
+                continue
+            hn = h_cell[nb]
+            if not np.isfinite(hn):
+                continue
+            if abs(hn - hc) > eps_delta:          # 断崖 → 边界
+                continue
+            if abs(hn - float(seed_h)) > eps_total:
+                continue
+            visited[nb] = True
+            keep_cells.append(nb)
+            dq.append(nb)
+
+    # 被接受体素里的**所有**点都保留（之前只保留每格代表点，点数被严重低估）
+    accepted = np.zeros(len(keys), bool)
+    accepted[np.asarray(keep_cells, dtype=np.int64)] = True
+    return accepted[inv]
 
 
 def mask_uv_index(mask, uv, h=240, w=320):
