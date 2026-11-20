@@ -39,6 +39,22 @@ def T_from(xyz, rpy):
     return T
 
 
+UP = np.array([0.0, -1.0, 0.0])          # 相机 y 向下，桌面朝上 = -y
+_E1 = np.array([1.0, 0.0, 0.0])          # 平面内基 1（相机 x）
+_E2 = np.cross(UP, _E1)                  # 平面内基 2
+
+
+def yaw_up(R):
+    """绕桌面法线的 yaw（度）。不依赖 box 的 z 正负/xy 命名，避免口径混用。"""
+    x = np.asarray(R, dtype=np.float64)[:, 0]
+    x = x - UP * float(x @ UP)
+    n = np.linalg.norm(x)
+    if n < 1e-9:
+        return 0.0
+    x /= n
+    return math.degrees(math.atan2(float(x @ _E2), float(x @ _E1)))
+
+
 def rot_err_deg(Ra, Rb):
     R = Ra @ Rb.T
     c = (np.trace(R) - 1.0) / 2.0
@@ -212,11 +228,14 @@ def main():
     class Gt(Node):
         def __init__(self):
             super().__init__('pose_gt_aruco')
+            self.prev_c = None
             self.det = make_detector(dict_name)
             self.latest = {}
             self.errs = []
             self.f = open(args.csv, 'w')
-            self.f.write('stamp,label,dx_cm,dy_cm,dz_cm,dp_cm,drot_deg,dyaw_deg\n')
+            self.f.write('t,label,dx_cm,dy_cm,dz_cm,dp_cm,dyaw_deg,'
+                         'gt_x,gt_y,gt_z,pred_x,pred_y,pred_z\n')
+            self.t0 = None
             self.create_subscription(Image, '/camera/color/image_raw', self.on_img,
                                      qos_profile_sensor_data)
             self.create_subscription(ObjectClouds, '/astra_seg/objects', self.on_obj, 10)
@@ -274,19 +293,31 @@ def main():
                     T = pose_of_marker(pts, marker_size, Km)
                 if T is None:
                     continue
+                # 时间连续性：marker 不可能一帧跳 5 cm（多半是角点配错/二义性）
+                c_now = T[:3, 3]
+                if self.prev_c is not None and np.linalg.norm(c_now - self.prev_c) > 0.05:
+                    continue
+                self.prev_c = c_now
                 T_obj = T @ T_mo
                 cands = self.latest.get(label) or []
                 if not cands:
                     continue
                 c_gt = T_obj[:3, 3]
                 best = min(cands, key=lambda c: np.linalg.norm(c[0] - c_gt))
+                if np.linalg.norm(best[0] - c_gt) > 0.25:
+                    continue                     # 对不上号，不算误差
                 e = c_gt - best[0]
-                self.errs.append((e, rot_err_deg(best[1], T_obj[:3, :3]),
-                                  yaw_of(best[1]) - yaw_of(T_obj[:3, :3])))
-                self.f.write(f'{msg.header.stamp.sec}.{msg.header.stamp.nanosec},'
-                             f'{label},{e[0]*100:.2f},{e[1]*100:.2f},{e[2]*100:.2f},'
-                             f'{np.linalg.norm(e)*100:.2f},'
-                             f'{self.errs[-1][1]:.2f},{self.errs[-1][2]:.2f}\n')
+                dyaw = (yaw_up(best[1]) - yaw_up(T_obj[:3, :3]) + 180.0) % 360.0 - 180.0
+                self.errs.append((e, abs(dyaw), dyaw))
+                t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                if self.t0 is None:
+                    self.t0 = t
+                self.f.write(
+                    f'{t - self.t0:.3f},{label},{e[0]*100:.3f},{e[1]*100:.3f},{e[2]*100:.3f},'
+                    f'{np.linalg.norm(e)*100:.3f},{self.errs[-1][2]:.3f},'
+                    f'{c_gt[0]:.4f},{c_gt[1]:.4f},{c_gt[2]:.4f},'
+                    f'{best[0][0]:.4f},{best[0][1]:.4f},{best[0][2]:.4f}\n')
+                self.f.flush()
 
         def report(self):
             if not self.errs:
@@ -294,7 +325,7 @@ def main():
             d = np.array([np.linalg.norm(e[0]) for e in self.errs]) * 100
             r = np.array([e[1] for e in self.errs])
             print(f'[gt] n={len(d)}  平移 p50={np.percentile(d,50):.2f} cm '
-                  f'p95={np.percentile(d,95):.2f} cm | 旋转 p50={np.percentile(r,50):.1f}° '
+                  f'p95={np.percentile(d,95):.2f} cm | yaw p50={np.percentile(r,50):.1f}° '
                   f'p95={np.percentile(r,95):.1f}°', flush=True)
             self.errs.clear()
 

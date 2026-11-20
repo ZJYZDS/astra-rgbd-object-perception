@@ -50,6 +50,75 @@ def draw_obb(img, obb, fx, fy, cx, cy, color=(0, 255, 255), thickness=1):
     return img
 
 
+def points_pixel_mask(pts, fx, fy, cx, cy, shape, block=3):
+    """把 3D 点投影成像素掩码（"3D 点覆盖了哪些像素"）。
+
+    stride 采样后点云是稀疏网格，所以每个点按 block×block 铺开，再闭运算补缝，
+    得到的就是"这份 3D 点云在图像上的覆盖面"。
+    """
+    h, w = shape
+    m = np.zeros((h, w), np.uint8)
+    P = np.asarray(pts, dtype=np.float64)
+    if len(P) == 0:
+        return m
+    z = P[:, 2]
+    ok = z > 1e-3
+    if not ok.any():
+        return m
+    u = (fx * P[ok, 0] / z[ok] + cx).round().astype(np.int32)
+    v = (fy * P[ok, 1] / z[ok] + cy).round().astype(np.int32)
+    keep = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    m[v[keep], u[keep]] = 255
+    if block > 1:
+        m = cv2.dilate(m, np.ones((block, block), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    return m
+
+
+def blend_mask(img, mask, color, alpha=0.28):
+    if mask is None or not mask.any():
+        return img
+    ov = img.copy()
+    ov[mask > 0] = color
+    cv2.addWeighted(ov, alpha, img, 1.0 - alpha, 0, img)
+    return img
+
+
+def draw_obb_outline(img, obb, fx, fy, cx, cy, color=(0, 255, 255), thickness=1):
+    """只画框的投影轮廓（细边，不填充）。"""
+    corners = obb.corners()
+    uv, ok = project(corners, fx, fy, cx, cy)
+    if not ok.all():
+        return img
+    h, w = img.shape[:2]
+    pts = np.clip(uv, [0, 0], [w - 1, h - 1]).astype(np.int32)
+    hull = cv2.convexHull(pts)
+    cv2.polylines(img, [hull], True, color, thickness, cv2.LINE_AA)
+    return img
+
+
+def draw_obb_mask(img, obb, fx, fy, cx, cy, color=(0, 255, 255), alpha=0.22,
+                  outline=True):
+    """把 3D 框的投影轮廓画成**浅色面片**（代替线框）。
+
+    RGB 上用线框判断 3D 框好不好本身就不可靠（透视下前后面重叠、棱边位置随视角变），
+    改成"这个框在图像上覆盖了哪块面积"，配合细轴看朝向，判读更直接。
+    """
+    corners = obb.corners()
+    uv, ok = project(corners, fx, fy, cx, cy)
+    if not ok.all():
+        return img
+    h, w = img.shape[:2]
+    pts = np.clip(uv, [0, 0], [w - 1, h - 1]).astype(np.int32)
+    hull = cv2.convexHull(pts)
+    overlay = img.copy()
+    cv2.fillConvexPoly(overlay, hull, color, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+    if outline:
+        cv2.polylines(img, [hull], True, color, 1, cv2.LINE_AA)
+    return img
+
+
 def draw_grasp(img, grasp, fx, fy, cx, cy, color=(0, 0, 255)):
     h, w = img.shape[:2]
     pos = np.asarray(grasp.position, dtype=np.float64)

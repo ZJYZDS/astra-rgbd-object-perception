@@ -1,0 +1,97 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /debug_objects1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: false
+      Name: Grid
+      Cell Size: 0.1
+      Plane Cell Count: 30
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: debug_plane
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /astra_seg/debug/plane
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: RGB8
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: debug_objects
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /astra_seg/debug/objects
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: RGB8
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: debug_boxes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /astra_seg/debug/boxes
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: RGB8
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: gt_compare
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /astra_seg/gt_compare
+      Max Value: 1.0
+      Min Value: 0.0
+      Normalize Range: true
+  Enabled: true
+  Global Options:
+    Background Color: 18; 18; 22
+    Fixed Frame: camera_color_optical_frame
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.15
+      Focal Point:
+        X: -0.05
+        Y: 0.05
+        Z: 1.0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: -1.15
+      Target Frame: <Fixed Frame>
+      Yaw: 4.71
+Window Geometry:
+  Height: 900
+  Width: 1400

@@ -40,6 +40,8 @@
 | `quality` | 逐实例 | 可解性门控：认领率/法线残差/平面内点比/圆柱长宽比/遮挡比例越界 → `0`（框画灰，下游别抓） |
 | `label_vote_decay` | 0.85 | 按 track 类别投票，分数低于 `min_label_score` 直接记 `object`，避免 book↔cell phone 抖动 |
 
+> 经验与坑的完整清单（每条带实测数字）：[docs/LESSONS.md](docs/LESSONS.md)
+
 ## 调试记录
 
 | 现象（实测） | 根因 | 修法 |
@@ -82,6 +84,7 @@
 | `/astra_seg/color` | 发布 | `Image` | 落包用的原始彩色帧 |
 | `/astra_seg/depth` | 发布 | `Image` | 可选落包（`save_depth: true`） |
 | `/astra_seg/yaw_valid` | 发布 | `UInt8MultiArray` | 每个实例的 yaw 是否可信（1/0） |
+| `/astra_seg/gt_compare` | 发布 | `Image` | GT 对照视图：预测=3D 点投影浅色 mask + 细轮廓 + 细轴；GT/ArUco 细轴（`scripts/gt_viz.py`） |
 
 `ObjectClouds` 字段：`ids/labels/scores`、`clouds`（xyz+rgb 点云）、`obb_poses`（位置+四元数）、
 `obb_dims`（l,w,h）、`obb_corners`（8 角点）、`grasp_poses/types/widths/scores`、

@@ -32,14 +32,15 @@ from std_msgs.msg import Header
 from astra_seg_interfaces.msg import ObjectClouds
 from geometry_msgs.msg import Point, Pose, Vector3
 
-from .annotate import (caption_strip, draw_axes_plain, draw_grasp, draw_mask_overlay,
-                       draw_label, draw_obb)
+from .annotate import (blend_mask, caption_strip, draw_axes_plain, draw_grasp,
+                       draw_label, draw_mask_overlay, draw_obb, draw_obb_outline,
+                       points_pixel_mask)
 from .bag_recorder import BagRecorder
 from .cloud_builder import build_cloud, instance_color, obb_edge_points
 from .grasp import GripperConfig, evaluate
 from .obb import (clean_by_plane, depth_to_points, filter_to_obb, fit_cylinder_obb,
                   fit_obb, fit_obb_on_plane, mask_quad, quat_from_matrix,
-                  tighten_to_points,
+                  shrink_if_mask_oversized, tighten_to_points,
                   ransac_plane_largest, voxel_downsample)
 from std_msgs.msg import UInt8MultiArray
 from .pose_filter import PoseSmoother, SizePrior
@@ -169,6 +170,7 @@ class SegCloudNode(Node):
             center_max_step=float(p('pose_center_max_step', 0.05).value))
         self.size_prior_enable = bool(p('size_prior_enable', False).value)
         self.tighten_cloud = bool(p('tighten_to_cloud', False).value)  # 实测会把框收小，默认关
+        self.mask_fill_gate = float(p('mask_fill_gate', 0.6).value)    # 点云填充率低于它就按点云收框
         self.size_prior = SizePrior(
             window=int(p('size_prior_window', 150).value),
             min_samples=int(p('size_prior_min', 20).value))
@@ -530,6 +532,10 @@ class SegCloudNode(Node):
         for it in items:
             det, tid, pts, cols = it['det'], it['tid'], it['pts'], it['cols']
             obb, grasp = it['obb'], it['grasp']
+            quality = int(it.get('quality', 1))
+            # 低分 + mask 与点云不一致 = 误检（把"书+垫纸"当一个物体），整条丢弃
+            if quality == 0 and float(det.score) < 0.25:
+                continue
             out.ids.append(int(tid))
             out.labels.append(det.label)
             out.scores.append(float(det.score))
@@ -546,7 +552,7 @@ class SegCloudNode(Node):
                 self._fill_pose(out, obb, grasp)
                 out.quality.append(int(it.get('quality', 1)))
                 self._draw(annot, obb, grasp, det, out, it.get('mask_dbg'),
-                           int(it.get('quality', 1)))
+                           int(it.get('quality', 1)), it.get('pts'))
 
         self.pose_smoother.prune(set(int(i) for i in ids))
         # 注意：不能按"这一帧没出现"就删投票记忆——漏检 1 帧就把历史清掉，
@@ -812,6 +818,11 @@ class SegCloudNode(Node):
                 obb, grasp = self._estimate(P2, det.label, tid, det.mask, depth)
                 if obb is not None and self.tighten_cloud:
                     obb = tighten_to_points(obb, P2)
+                if obb is not None and self.mask_fill_gate < 1.0:
+                    # mask 把"物体+垫纸"连成一片时，四边形会横跨两者；用点云范围纠正
+                    obb, _fill = shrink_if_mask_oversized(obb, P_full, self.mask_fill_gate)
+                    if _fill < self.mask_fill_gate:
+                        quality = 0        # 这一帧的 mask 不可信，标记给下游
                 if obb is not None:
                     # 尺寸先验：只替换 3σ 以外的离群测量（正常帧不动）
                     if self.size_prior_enable:
@@ -1052,7 +1063,7 @@ class SegCloudNode(Node):
             out.grasp_scores.append(0.0)
         out.grasp_poses.append(gp)
 
-    def _draw(self, annot, obb, grasp, det, out, mask_dbg=None, quality=1):
+    def _draw(self, annot, obb, grasp, det, out, mask_dbg=None, quality=1, pts=None):
         if annot is None or obb is None or grasp is None:
             return
         # 框颜色 = 该实例在 RViz 里的颜色；质量可疑时画灰色（下游别抓）
@@ -1062,10 +1073,16 @@ class SegCloudNode(Node):
             color = (140, 140, 140)
         if mask_dbg is not None:
             draw_mask_overlay(annot, mask_dbg, color, alpha=0.30)
-        draw_obb(annot, obb, self.fx, self.fy, self.cx, self.cy, color)
+        # RGB 上：3D 点投影成浅色 mask（真正"3D 点覆盖了哪块像素"）+ 框的细轮廓
+        if pts is not None and len(pts) > 0:
+            pm = points_pixel_mask(pts, self.fx, self.fy, self.cx, self.cy,
+                                   annot.shape[:2], block=3)
+            blend_mask(annot, pm, color, alpha=0.26)
+        draw_obb_outline(annot, obb, self.fx, self.fy, self.cx, self.cy, color, thickness=1)
         if self.draw_grasp_flag:
             draw_grasp(annot, grasp, self.fx, self.fy, self.cx, self.cy, color)
-        draw_axes_plain(annot, obb, self.fx, self.fy, self.cx, self.cy, length=0.05)
+        draw_axes_plain(annot, obb, self.fx, self.fy, self.cx, self.cy,
+                        length=0.045, thickness=1)
         # 文字不压在画面上，统一放到下方说明条
         c = obb.center
         yaw = self._yaw_deg.get(int(out.ids[-1]))

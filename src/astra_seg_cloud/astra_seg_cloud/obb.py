@@ -670,6 +670,32 @@ def tighten_to_points(obb, points, lo=1.0, hi=99.0, margin=0.001):
     return obb
 
 
+def shrink_if_mask_oversized(obb, points, fill_gate=0.6, margin=0.004):
+    """mask 四边形远大于点云时，按点云范围收 footprint。
+
+    mask 会把"书 + 垫纸"识别成一个物体（COCO 常见），四边形跟着 mask 走就横跨两者；
+    而点云（真有深度的部分）只覆盖书。用 fill = 点云范围 / 框尺寸 判断：
+    正常物体 fill 0.75~1.0；mask 明显偏大时 fill < 0.6，此时按点云收紧。
+    """
+    if obb is None or points is None or len(points) < 30:
+        return obb, 1.0
+    rel = (np.asarray(points, dtype=np.float32) - obb.center) @ obb.rotation
+    lo = np.percentile(rel, 1.0, axis=0)
+    hi = np.percentile(rel, 99.0, axis=0)
+    ext = np.maximum(hi - lo, 1e-4)
+    fill = float(np.min(ext[:2] / np.maximum(obb.dims[:2], 1e-6)))
+    if fill >= fill_gate:
+        return obb, fill
+    new = obb.dims.copy()
+    shift = (lo + hi) / 2.0
+    shift[2] = 0.0
+    new[0] = min(ext[0] + margin, obb.dims[0])
+    new[1] = min(ext[1] + margin, obb.dims[1])
+    obb.center = (obb.center + obb.rotation @ shift.astype(np.float32)).astype(np.float32)
+    obb.dims = new.astype(np.float32)
+    return obb, fill
+
+
 def contain_points(obb, points, margin=0.002):
     """把 OBB 扩到严格包住点云（在 OBB 自身坐标系里求紧包围盒）。
 
