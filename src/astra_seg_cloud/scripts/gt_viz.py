@@ -112,6 +112,8 @@ def main():
     ap.add_argument('--no-pub', action='store_true')
     ap.add_argument('--axis-len', type=float, default=0.06)
     ap.add_argument('--boxes', action='store_true', help='同时画 3D 框的 12 条棱')
+    ap.add_argument('--csv', default=os.path.expanduser('~/gt_aruco/yaw_live.csv'))
+    ap.add_argument('--stats-every', type=float, default=2.0)
     args = ap.parse_args()
 
     import yaml
@@ -141,7 +143,10 @@ def main():
 
     PRED_COL = ((60, 60, 255), (60, 220, 60), (255, 160, 40))     # BGR: x红 y绿 z蓝
     GT_COL = ((120, 120, 255), (120, 255, 120), (255, 200, 120))
-    state = {'img': None, 'stamp': None, 'objs': [], 'err': None, 'n': 0, 'last_save': 0.0}
+    state = {'img': None, 'stamp': None, 'objs': [], 'err': None, 'n': 0,
+             'last_save': 0.0, 'ys': [], 'last_stats': 0.0, 't0': None}
+    csv_f = open(args.csv, 'w')
+    csv_f.write('t,label,id,gt_yaw_deg,pred_yaw_deg,dyaw_deg\n')
 
     class Viz(Node):
         def __init__(self):
@@ -166,7 +171,8 @@ def main():
                     [s * (x * y + z * w), 1 - s * (x * x + z * z), s * (y * z - x * w)],
                     [s * (x * z - y * w), s * (y * z + x * w), 1 - s * (x * x + y * y)]])
                 T = np.eye(4); T[:3, :3] = R; T[:3, 3] = [p.x, p.y, p.z]
-                rows.append((lab, float(msg.scores[i]), T, msg.obb_dims[i]))
+                rows.append((lab, float(msg.scores[i]), T, msg.obb_dims[i],
+                             int(msg.ids[i]) if hasattr(msg, 'ids') else 0))
             state['objs'] = rows
 
         def on_img(self, msg):
@@ -181,24 +187,46 @@ def main():
                     continue
                 p4 = solve_planar(pts, obj_pts, R_base)
                 T_m = np.eye(4); T_m[:3, :3] = R_base @ rpy_to_R(0, 0, p4[3]); T_m[:3, 3] = p4[:3]
-                T_mo = T_from(info.get('t_marker_obj', [0, 0, 0]),
-                              info.get('rpy_marker_obj', [0, 0, 0]))
-                T_gt = T_m @ T_mo
+                yaw_off = math.radians(float(cfg.get('yaw_offset_deg', 90.0)))
+                T_gt = np.eye(4)
+                T_gt[:3, :3] = T_m[:3, :3] @ rpy_to_R(0, 0, yaw_off)   # 只在平面内转
+                T_gt[:3, 3] = T_m[:3, 3]
                 n_mk += 1
                 # 选最近的同标签实例
                 want = [x.strip() for x in str(info.get('label', '')).split(',') if x.strip()]
                 cands = [r for r in state['objs'] if r[0] in want] or state['objs']
                 if not cands:
                     continue
-                lab, score, T_pd, d = min(cands, key=lambda r: np.linalg.norm(r[2][:3, 3] - T_gt[:3, 3]))
-                if np.linalg.norm(T_pd[:3, 3] - T_gt[:3, 3]) > 0.25:
-                    continue                      # 对不上号就不画，避免误导
-                dp = (T_gt[:3, 3] - T_pd[:3, 3]) * 1000.0
+                mk_px = project(K, T_m[:3, 3])
+                if mk_px is None:
+                    continue
+
+                def _px_dist(r):
+                    p = project(K, r[2][:3, 3])
+                    return 1e9 if p is None else math.hypot(p[0] - mk_px[0], p[1] - mk_px[1])
+
+                lab, score, T_pd, d, tid = min(cands, key=_px_dist)
+                if _px_dist((lab, score, T_pd, d, tid)) > 120:
+                    continue                      # 图像上离码太远，视为对不上号
+                # 位置 GT 不做（marker 与书不是刚性连接时没有意义）；只比 yaw，折叠 180° 歧义
                 dyaw = (yaw_up(T_pd[:3, :3]) - yaw_up(T_gt[:3, :3]) + 180.0) % 360.0 - 180.0
-                state['err'] = (dp, dyaw)
+                if dyaw > 90.0:
+                    dyaw -= 180.0
+                elif dyaw <= -90.0:
+                    dyaw += 180.0
+                state['err'] = (np.zeros(3), dyaw)
+                t_now = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                if state['t0'] is None:
+                    state['t0'] = t_now
+                state['ys'].append(dyaw)
+                csv_f.write(
+                    f'{t_now - state["t0"]:.3f},{lab},{tid},'
+                    f'{yaw_up(T_gt[:3, :3]):.2f},{yaw_up(T_pd[:3, :3]):.2f},{dyaw:.2f}\n')
+                csv_f.flush()
+                T_gt[:3, 3] = T_pd[:3, 3]        # 把 GT 轴画在预测中心，方便看 yaw 差
                 # 画：GT 虚线 + 预测实线
                 # 预测：浅色 3D 面片 + 细轴（RGB 上不画线框——“框对不对”在点云里判断）
-                draw_mask_poly(img, K, T_pd, [d.x, d.y, d.z], PRED_COL[1], alpha=0.22)
+                draw_box(img, K, T_pd, [d.x, d.y, d.z], PRED_COL[1], thick=1)
                 draw_axis(img, K, T_pd, args.axis_len, PRED_COL, thick=1, tip=False, tag='')
                 # GT：细轴（虚线，方便和预测轴区分）
                 draw_axis(img, K, T_gt, args.axis_len, GT_COL, dashed=True, thick=1, tip=False)
@@ -209,7 +237,7 @@ def main():
                 o_gt = project(K, T_gt[:3, 3]); o_pd = project(K, T_pd[:3, 3])
                 if o_gt and o_pd:
                     cv2.line(img, o_gt, o_pd, (255, 255, 255), 1, cv2.LINE_AA)
-                txt = f'GT  dp={np.linalg.norm(dp):.1f}mm dyaw={dyaw:+.1f}deg  {lab}'
+                txt = f'yaw GT vs PRED: {dyaw:+.1f} deg   [{lab}]'
                 y0 = 12 + 12 * (n_mk - 1)
                 cv2.putText(img, txt, (6, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
                             (255, 255, 255), 2, cv2.LINE_AA)
@@ -231,6 +259,19 @@ def main():
                 self.pub.publish(m)
 
             now = time.time()
+            if state['ys'] and now - state['last_stats'] >= args.stats_every:
+                state['last_stats'] = now
+                y = np.asarray(state['ys'])
+                stats = (f'n={len(y)}  dyaw mean={y.mean():+.2f}  std={y.std():.2f}  '
+                         f'p95|.|={np.percentile(np.abs(y), 95):.2f}  max|.|={np.abs(y).max():.2f}')
+                print(f'[gtstat] {stats}', flush=True)
+                state['stats_txt'] = stats
+            if state.get('stats_txt'):
+                txt = state['stats_txt']
+                cv2.putText(img, txt, (6, img.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.32, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(img, txt, (6, img.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.32, (20, 20, 20), 1, cv2.LINE_AA)
             if now - state['last_save'] >= args.save_every:
                 state['last_save'] = now
                 if not hasattr(self, '_save_i'):

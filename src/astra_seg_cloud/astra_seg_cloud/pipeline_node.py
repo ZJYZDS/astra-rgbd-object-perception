@@ -34,13 +34,13 @@ from geometry_msgs.msg import Point, Pose, Vector3
 
 from .annotate import (blend_mask, caption_strip, draw_axes_plain, draw_grasp,
                        draw_label, draw_mask_overlay, draw_obb, draw_obb_outline,
-                       points_pixel_mask)
+                       points_pixel_mask, project)
 from .bag_recorder import BagRecorder
 from .cloud_builder import build_cloud, instance_color, obb_edge_points
 from .grasp import GripperConfig, evaluate
 from .obb import (clean_by_plane, depth_to_points, filter_to_obb, fit_cylinder_obb,
                   fit_obb, fit_obb_on_plane, mask_quad, quat_from_matrix,
-                  shrink_if_mask_oversized, tighten_to_points,
+                  tighten_to_points,
                   ransac_plane_largest, voxel_downsample)
 from std_msgs.msg import UInt8MultiArray
 from .pose_filter import PoseSmoother, SizePrior
@@ -70,6 +70,37 @@ OBJECTS_TOPIC = '/astra_seg/objects'
 ANNOTATED_TOPIC = '/astra_seg/annotated'
 BAG_COLOR_TOPIC = '/astra_seg/color'
 BAG_DEPTH_TOPIC = '/astra_seg/depth'
+
+
+def _rotz(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _solve_planar(uv, obj, R_base, K, p0=(0.0, 0.0, 0.8, 0.0), iters=25):
+    """已知平面基 R_base，只解 (x, y, z, yaw)。数值雅可比 Gauss-Newton，无 scipy 依赖。"""
+    fx, fy, cx, cy = K
+    p = np.array(p0, dtype=np.float64)
+    uv = np.asarray(uv, dtype=np.float64)
+
+    def project_all(q):
+        R = R_base @ _rotz(q[3])
+        cam = (R @ obj.T).T + q[:3]
+        return np.stack([fx * cam[:, 0] / cam[:, 2] + cx,
+                         fy * cam[:, 1] / cam[:, 2] + cy], axis=1)
+
+    for _ in range(iters):
+        r = (project_all(p) - uv).ravel()
+        J = np.zeros((len(r), 4))
+        for k in range(4):
+            q = p.copy(); q[k] += 1e-5
+            J[:, k] = ((project_all(q) - uv).ravel() - r) / 1e-5
+        dp, *_ = np.linalg.lstsq(J, -r, rcond=None)
+        p = p + 0.7 * dp
+        p[2] = min(max(p[2], 0.2), 2.0)
+        if np.linalg.norm(dp) < 1e-7:
+            break
+    return p
 
 
 class SegCloudNode(Node):
@@ -170,7 +201,10 @@ class SegCloudNode(Node):
             center_max_step=float(p('pose_center_max_step', 0.05).value))
         self.size_prior_enable = bool(p('size_prior_enable', False).value)
         self.tighten_cloud = bool(p('tighten_to_cloud', False).value)  # 实测会把框收小，默认关
-        self.mask_fill_gate = float(p('mask_fill_gate', 0.6).value)    # 点云填充率低于它就按点云收框
+        self.aruco_mask = bool(p('aruco_mask', True).value)          # 检测前抹掉 ArUco
+        self.aruco_dict = str(p('aruco_dict', 'DICT_4X4_50').value)
+        self.aruco_size_m = float(p('aruco_size_m', 0.096).value)
+        self.draw_aruco_axis = bool(p('draw_aruco_axis', True).value)   # 在 RGB 上画 ArUco 细轴
         self.size_prior = SizePrior(
             window=int(p('size_prior_window', 150).value),
             min_samples=int(p('size_prior_min', 20).value))
@@ -303,6 +337,85 @@ class SegCloudNode(Node):
             f'输出 {OBJECTS_TOPIC}，等待相机数据…')
 
     # ------------------------------------------------------------------ 工具
+    def _suppress_aruco(self, bgr):
+        """检测前把 ArUco 码区域抹掉（inpaint）。
+
+        为什么：码贴在物体旁边/上面时，YOLO 会把它和物体、垫纸合成一个物体，
+        mask 一大，我们的框就跟着大（实测 book 25.6 vs 真值 23.4）。
+        先把码"擦"掉，检测器看到的就是干净的物体。
+        只在检测图上抹，发布的点云颜色仍用原图。
+        """
+        if not self.aruco_mask and not self.draw_aruco_axis:
+            return bgr, []
+        try:
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            dic = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.aruco_dict))
+            if hasattr(cv2.aruco, 'ArucoDetector'):
+                corners, ids, _ = cv2.aruco.ArucoDetector(dic).detectMarkers(gray)
+            else:
+                corners, ids, _ = cv2.aruco.detectMarkers(gray, dic)
+            if ids is None:
+                return bgr, []
+            mask = np.zeros(gray.shape, np.uint8)
+            for c in corners:
+                pts = c.reshape(-1, 2)
+                centre = pts.mean(axis=0)
+                pts = centre + (pts - centre) * 1.30      # 连白边一起抹
+                cv2.fillConvexPoly(mask, np.round(pts).astype(np.int32), 255)
+            mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+            # 填充色取"码外围一圈"的中位色（纸/桌面），不能用 inpaint：
+            # inpaint 会把旁边物体的深色抹过来，反而和物体粘成一块，mask 更大。
+            ring = cv2.dilate(mask, np.ones((41, 41), np.uint8))
+            ring = cv2.bitwise_and(ring, cv2.bitwise_not(mask))
+            sel = ring > 0
+            if int(sel.sum()) < 200:
+                sel = np.ones_like(mask, bool)
+            fill = tuple(int(v) for v in np.median(bgr[sel].reshape(-1, 3), axis=0))
+            cleaned = bgr.copy()
+            cleaned[mask > 0] = fill
+            marks = [(int(i), c.reshape(4, 2)) for i, c in zip(ids.flatten(), corners)]
+            return cleaned, marks
+        except Exception:
+            return bgr, []
+
+    def _draw_aruco_axes(self, img, markers):
+        """在 RGB 上画 ArUco 本体的细三轴（1 px），便于目视比对码与物体朝向。"""
+        if not self.draw_aruco_axis or not markers or self._table_n is None:
+            return
+        n_t = np.asarray(self._table_n, dtype=np.float64)
+        n_t = n_t / (np.linalg.norm(n_t) + 1e-12)
+        u_ax = np.cross(n_t, [1.0, 0.0, 0.0])
+        if np.linalg.norm(u_ax) < 1e-6:
+            u_ax = np.cross(n_t, [0.0, 0.0, 1.0])
+        u_ax /= np.linalg.norm(u_ax)
+        R_base = np.stack([u_ax, np.cross(n_t, u_ax), n_t], axis=1)
+        half = self.aruco_size_m / 2.0
+        obj = np.array([[-half, half, 0], [half, half, 0],
+                        [half, -half, 0], [-half, -half, 0]], dtype=np.float64)
+        colors = ((80, 80, 255), (80, 255, 80), (255, 160, 80))
+        for mid, pts in markers:
+            p4 = _solve_planar(pts, obj, R_base, (self.fx, self.fy, self.cx, self.cy))
+            if p4 is None:
+                continue
+            R = R_base @ _rotz(p4[3])
+            c = np.asarray(p4[:3], dtype=np.float64)
+            for k in range(3):
+                uv, ok = project(np.array([c, c + R[:, k] * 0.055]),
+                                 self.fx, self.fy, self.cx, self.cy)
+                if not ok.all():
+                    continue
+                p0 = tuple(np.int32(np.clip(uv[0], [0, 0], [img.shape[1] - 1, img.shape[0] - 1])))
+                p1 = tuple(np.int32(np.clip(uv[1], [0, 0], [img.shape[1] - 1, img.shape[0] - 1])))
+                cv2.line(img, p0, p1, colors[k], 1, cv2.LINE_AA)
+                cv2.putText(img, 'xyz'[k], (int(p1[0]) + 1, int(p1[1]) - 1),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.24, colors[k], 1, cv2.LINE_AA)
+            uv0, ok0 = project(np.array([c]), self.fx, self.fy, self.cx, self.cy)
+            if ok0.all():
+                p0 = tuple(np.int32(uv0[0]))
+                cv2.circle(img, p0, 1, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.putText(img, f'ArUco{mid}', (p0[0] + 3, p0[1] + 9),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.26, colors[0], 1, cv2.LINE_AA)
+
     def _filter_roi(self, dets, w, h):
         """只保留落在画面中心区域的检测。
 
@@ -395,6 +508,7 @@ class SegCloudNode(Node):
         bgr = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
         if bgr.ndim == 2:
             bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+        bgr_det, aruco_markers = self._suppress_aruco(bgr)   # 检测图：ArUco 抹掉
         depth = self._depth_array(depth_msg)
         h, w = bgr.shape[:2]
         if depth.shape[:2] != (h, w):
@@ -443,7 +557,7 @@ class SegCloudNode(Node):
 
         self._yaw_flags = {}
         self._yaw_deg = {}
-        dets = self.model.infer(bgr)
+        dets = self.model.infer(bgr_det)
         # ---- 副模型只负责指定类别（例如 remote），避免"一个模型必须全会" ----
         if self.secondary is not None and self.secondary_classes:
             dets = [d for d in dets if d.label not in self.secondary_classes]
@@ -533,9 +647,8 @@ class SegCloudNode(Node):
             det, tid, pts, cols = it['det'], it['tid'], it['pts'], it['cols']
             obb, grasp = it['obb'], it['grasp']
             quality = int(it.get('quality', 1))
-            # 低分 + mask 与点云不一致 = 误检（把"书+垫纸"当一个物体），整条丢弃
-            if quality == 0 and float(det.score) < 0.25:
-                continue
+            if obb is None:
+                continue          # 没有位姿就不发布（避免 0,0,0 尺寸的实例）
             out.ids.append(int(tid))
             out.labels.append(det.label)
             out.scores.append(float(det.score))
@@ -580,6 +693,7 @@ class SegCloudNode(Node):
             self._caption_order = order
             rows = [self._caption_rows[i] for i in order if i in self._caption_rows]
             self._caption_rows = {k: v for k, v in self._caption_rows.items() if k in ids_now}
+            self._draw_aruco_axes(annot, aruco_markers)
             if rows:
                 annot = np.vstack([annot, caption_strip(
                     [r[0] for r in rows], annot.shape[1],
@@ -818,11 +932,7 @@ class SegCloudNode(Node):
                 obb, grasp = self._estimate(P2, det.label, tid, det.mask, depth)
                 if obb is not None and self.tighten_cloud:
                     obb = tighten_to_points(obb, P2)
-                if obb is not None and self.mask_fill_gate < 1.0:
-                    # mask 把"物体+垫纸"连成一片时，四边形会横跨两者；用点云范围纠正
-                    obb, _fill = shrink_if_mask_oversized(obb, P_full, self.mask_fill_gate)
-                    if _fill < self.mask_fill_gate:
-                        quality = 0        # 这一帧的 mask 不可信，标记给下游
+
                 if obb is not None:
                     # 尺寸先验：只替换 3σ 以外的离群测量（正常帧不动）
                     if self.size_prior_enable:
@@ -1073,12 +1183,8 @@ class SegCloudNode(Node):
             color = (140, 140, 140)
         if mask_dbg is not None:
             draw_mask_overlay(annot, mask_dbg, color, alpha=0.30)
-        # RGB 上：3D 点投影成浅色 mask（真正"3D 点覆盖了哪块像素"）+ 框的细轮廓
-        if pts is not None and len(pts) > 0:
-            pm = points_pixel_mask(pts, self.fx, self.fy, self.cx, self.cy,
-                                   annot.shape[:2], block=3)
-            blend_mask(annot, pm, color, alpha=0.26)
-        draw_obb_outline(annot, obb, self.fx, self.fy, self.cx, self.cy, color, thickness=1)
+        # RGB 上只画 1px 线框 + 1px 三轴（线框太粗会挡住物体，太细又看不清，1px 折中）
+        draw_obb(annot, obb, self.fx, self.fy, self.cx, self.cy, color, thickness=1)
         if self.draw_grasp_flag:
             draw_grasp(annot, grasp, self.fx, self.fy, self.cx, self.cy, color)
         draw_axes_plain(annot, obb, self.fx, self.fy, self.cx, self.cy,
